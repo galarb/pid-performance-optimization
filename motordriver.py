@@ -1,8 +1,10 @@
 from machine import Pin, PWM
-import time
+import time 
 import math
 from ili9341 import color565  # Import color565 for color handling
 from xglcd_font import XglcdFont
+import random
+
 
 class motordriver:
     def __init__(self, encoder1_pin, encoder2_pin, in1_pin, in2_pin, wheel_size, display, font):
@@ -18,7 +20,7 @@ class motordriver:
         self.pwm2.freq(1000)
         self.wheel_size = wheel_size
         self.degrees = 0
-
+        
         self.font = font  # Store the font for visualization
         self.display = display  # Store the display object
 
@@ -26,7 +28,9 @@ class motordriver:
         self.cum_error = 0
         self.previous_time = time.ticks_ms()
         self.integral_flag = False
-
+        
+        self.plot_step = 1  # Plot update step: Update plot every 'plot_step' iterations
+        self.total_iterations = 0  # Track total number of PID iterations
         self.iteration = 0  # Initialize iteration counter for plotting
         self.iteration_counter = 0  # To control how often pixels are plotted
 
@@ -42,7 +46,7 @@ class motordriver:
         else:
             self.degrees -= 1
 
-        print("Degrees: ", self.degrees)
+        #print("Degrees: ", self.degrees)
 
     def motgo(self, speed):
         pwm_value = int(min(max(abs(speed), 0), 100) * 10.23)  # Map -100 to 100 to 0 to 1023
@@ -59,71 +63,96 @@ class motordriver:
             # Stop the motor
             self.pwm1.duty(0)
             self.pwm2.duty(0)    
-        
+            self.in1.value(0)
+            self.in2.value(0)  # Explicitly stop the motor  
     
-
     def PIDcalc(self, inp, sp, kp, ki, kd, color):
         current_time = time.ticks_ms()
         elapsed_time = (current_time - self.previous_time) / 1000.0
 
+        # Ensure elapsed_time is positive to avoid division by zero
+        if elapsed_time <= 0:
+            return 0
+
+        # Calculate error
         error = sp - inp
 
+        # Reset integral term if error changes direction
         if error * self.last_error < 0:
             self.integral_flag = True
             self.cum_error = 0
-            print("Error changed direction, resetting integral accumulator.")
         else:
             self.integral_flag = False
 
+        # Update integral only if not flagged
         if not self.integral_flag:
             self.cum_error += error * elapsed_time
 
-        if elapsed_time > 0:
-            rate_error = (error - self.last_error) / elapsed_time
-            out = kp * error + ki * self.cum_error + kd * rate_error
+        # Calculate derivative and output
+        rate_error = (error - self.last_error) / elapsed_time
+        out = kp * error + ki * self.cum_error + kd * rate_error
 
-            self.last_error = error
-            self.previous_time = current_time
+        # Save current error and time for next iteration
+        self.last_error = error
+        self.previous_time = current_time
 
-            out = max(-254, min(254, out))  # Clamp the output to [-254, 254]
+        # Clamp output to motor limits
+        out = max(-254, min(254, out))
 
-            # Call the visualization function only after every 3rd iteration
-            self.iteration_counter += 1
-            if self.iteration_counter >= 3:  # Update graph every 3rd iteration
-                self.plot_pid(error, color)  # Plot the current error with the specified color
-                self.iteration_counter = 0  # Reset counter
+        # Increment the iteration counter for PID
+        self.iteration_counter += 1
+        if self.iteration_counter >= self.plot_step:
+            time.sleep(0.01)
+            self.plot_pid(out, color)
+            self.iteration_counter = 0  # Reset counter
 
-            print("Degrees: ", self.degrees)
-            print("PID output value: ", out)
-            return out
+        # Return PID output
+        return out
 
-        return 0
 
     
-        
     
     def plot_pid(self, error, color):
-        # Define the error range for scaling
-        max_error = 254  # Maximum possible error value
-        min_error = -254  # Minimum possible error value
+        # Initialize plot iteration counter if not already defined
+        if not hasattr(self, 'plot_iteration'):
+            self.plot_iteration = 0  # Initialize plot counter
 
         # Screen dimensions
-        screen_height = 240  # Height of the screen
-        screen_width = 240   # Width of the screen
+        screen_height = 240
+        screen_width = 240
 
-        # Calculate the Y-coordinate based on the scaled error
-        scaled_error = int(((error - min_error) / (max_error - min_error)) * screen_height)
-        y_position = screen_height - scaled_error  # Adjust for screen origin at top-left
+        # Scale the error to fit the screen height
+        max_error = 254
+        min_error = -254
+        y_position = int(((error - min_error) / (max_error - min_error)) * screen_height)
+        y_position = max(0, min(screen_height - 1, screen_height - y_position))
 
-        # Clamp Y within screen bounds
-        y_position = max(0, min(screen_height - 1, y_position))
+        # Adjust x-coordinate based on overall PID loop iteration
+        x_position = (self.total_iterations // self.plot_step) % screen_width
 
-        # Plot the pixel for the current iteration
-        x_position = self.iteration % screen_width  # Wrap at screen width
+        # Draw the pixel
         self.display.draw_pixel(x_position, y_position, color)
 
-        # Increment the iteration counter
-        self.iteration += 1
+        # Increment counters
+        self.plot_iteration += 1
+        self.total_iterations += 1  # Increment total iterations
+
+
+
+
+    def display_pid_values(self, kp, ki, kd, color, line_index):
+        # Line index determines where to display the PID values on the screen
+        text_y = 210 + (line_index * 28)  # Adjust vertical spacing based on font size
+
+        # Format the text
+        text = f"Kp={kp:.1f}, Ki={ki:.1f}, Kd={kd:.1f}"
+        
+        # Draw thicker text by offsetting slightly in multiple directions
+        offsets = [(0, 0), (1, 0), (0, 1)]  # Fewer offsets for reduced overhead
+   
+        # Display the text in the specified color using the provided font
+        for dx, dy in offsets:        
+            self.display.draw_text(5, text_y, text, self.font, color)
 
 
    
@@ -148,14 +177,17 @@ class motordriver:
             self.motgo(motspeed)
 
     
-    def godegreesp(self, angle, times, kp, ki, kd, color):
+    def godegreesp(self, angle, times, kp, ki, kd, color, line_index):
         for _ in range(times):
             motspeed = self.PIDcalc(angle, self.degrees, kp, ki, kd, color)
             motspeed = max(-254, min(254, motspeed))
             self.motgo(motspeed)
 
-    
-
+        self.display_pid_values(kp, ki, kd, color, line_index)
+        print('reached ', self.degrees, 'degrees')
+        
+        
+        
     def gomm(self, distance, times):
         deg = (distance / (self.wheel_size * math.pi)) * 360
         self.godegrees(deg, times)
